@@ -172,10 +172,6 @@ struct sl811hs {
     BYTE  sl_SigDone;
     struct timerequest *sl_TimeRequest;
 
-    struct MsgPort *sl_PollPort;          // Port for our polling timer
-    struct timerequest *sl_PollTimer;     // The timer request itself
-    BYTE sl_PollSignal;                   // The signal bit for the poll timer
-
     /* Internal state */
     UBYTE sl_State;
 
@@ -1613,16 +1609,14 @@ static void sl811hs_CommandTask(void)
                 ULONG sigfdone;
                 ULONG sigftime;
                 ULONG sigfpoll;
+            
+                BYTE wait_timeout_sig = -1;
 
                 sl->sl_TimeRequest = tr;
 
                 sl->sl_SigDone = AllocSignal(-1);
-                sl->sl_PollSignal = AllocSignal(-1);
+                wait_timeout_sig = AllocSignal(-1);
 
-                if(sl->sl_PollSignal != -1)
-                {
-                    sl->sl_PollPort = CreateMsgPort();
-                }
 
                 if(sl->sl_PollPort) {
                     sl->sl_PollTimer = (struct timerequest *)CreateIORequest(sl->sl_PollPort, sizeof(struct timerequest));
@@ -1646,22 +1640,12 @@ static void sl811hs_CommandTask(void)
                 sigfdone = (1 << sl->sl_SigDone);
                 sigfport = (1 << sl->sl_CommandPort->mp_SigBit);
                 sigftime = (1 << sl->sl_TimeRequest->tr_node.io_Message.mn_ReplyPort->mp_SigBit);
-                sigfpoll = (sl->sl_PollTimer) ? (1 << sl->sl_PollSignal) : 0;
 
-                sigmask  = sigfdone | sigfport | sigftime | sigfpoll; ;
+                sigmask  = sigfdone | sigfport | sigftime ;
 
-                SetSignal(0, sigmask);  // Clear any pending signals before we start
+                SetSignal(sigmask, sigmask);  // Clear any pending signals before we start
 
                 // Kick off the first poll timer request
-                if(sl->sl_PollTimer) // <-- ADD THIS block
-                {
-                    sl->sl_PollTimer->tr_node.io_Message.mn_ReplyPort->mp_SigBit = sl->sl_PollSignal;
-                    sl->sl_PollTimer->tr_node.io_Message.mn_ReplyPort->mp_SigTask = FindTask(NULL);
-                    sl->sl_PollTimer->tr_node.io_Command = TR_ADDREQUEST;
-                    sl->sl_PollTimer->tr_time.tv_secs = 0;
-                    sl->sl_PollTimer->tr_time.tv_micro = 20000; // Poll every 20ms
-                    SendIO((struct IORequest *)sl->sl_PollTimer);
-                }
 
                 sl->sl_Interrupt.is_Node.ln_Pri = 0;
                 sl->sl_Interrupt.is_Node.ln_Type = NT_INTERRUPT;
@@ -1679,48 +1663,42 @@ static void sl811hs_CommandTask(void)
                 sl811hs_ResetHW(sl);
 
                 for (;;) {
-                    ULONG sigset;
-                    struct MinList todo;
-                    NEWLIST(&todo);
+                        ULONG sigset;
+                        struct MinList todo;
+                        NEWLIST(&todo);
 
-                    sigset = Wait(sigmask);
+                        // Set a 20ms timeout on our Wait() call
+                        tr->tr_node.io_Command = TR_ADDREQUEST;
+                        tr->tr_time.tv_secs = 0;
+                        tr->tr_time.tv_micro = 20000; // 20ms
+                        SetSignal(0, 1 << wait_timeout_sig); // Clear the signal bit before use
+                        tr->tr_node.io_Message.mn_ReplyPort->mp_SigBit = wait_timeout_sig;
+                        tr->tr_node.io_Message.mn_ReplyPort->mp_SigTask = FindTask(NULL);
+                        SendIO((struct IORequest *)tr);
 
-                    sigset = Wait(sigmask);
-
-                    /************************************************************/
-                    /* NEW POLLING LOGIC - to catch missed interrupts           */
-                    /************************************************************/
-                    if (!IsListEmpty((struct List *)&sl->sl_XfersActive))
-                    {
-                        // A transfer is in-flight. Let's check the hardware status manually.
-                        UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
+                        // Wait for our standard signals OR the timeout signal
+                        sigset = Wait(sigmask | (1 << wait_timeout_sig));
                         
-                        // Check if the 'USB_A Done' bit is set in the hardware
-                        if (intstat & SL811HS_INTMASK_USB_A) {
-                            // The transaction is done but the interrupt was missed!
-                            // Manually signal our own task to run the interrupt
-                            // handling logic. This prevents code duplication.
-                            Signal(sl->sl_CommandTask, sigfdone);
+                        // IMPORTANT: If the wait was broken by a real signal, we must abort the timer request
+                        // so it doesn't fire later and corrupt our state.
+                        if(!(sigset & (1 << wait_timeout_sig))) {
+                            AbortIO((struct IORequest *)tr);
                         }
-                    }
+                        WaitIO((struct IORequest *)tr); // Wait for AbortIO or the timeout to complete
 
-                    // If our polling timer fired, we must re-arm it
-                    if(sigset & sigfpoll)
-                    {
-                        // Acknowledge the timer's reply message.
-                        // This is CRITICAL to clear the signal bit.
-                        // We use a while loop to ensure the port is empty.
-                        while(GetMsg(sl->sl_PollPort)) {
-                            /* do nothing, just empty the port */
+                        /************************************************************/
+                        /* POLLING LOGIC - now in a safe context                    */
+                        /************************************************************/
+                        if (!IsListEmpty((struct List *)&sl->sl_XfersActive))
+                        {
+                            UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
+                            if (intstat & SL811HS_INTMASK_USB_A) {
+                                // Manually trigger the 'done' logic
+                                Signal(sl->sl_CommandTask, sigfdone);
+                            }
                         }
+                        /************************************************************/
 
-                        // Now that the signal is clear, re-send the request for the next poll.
-                        sl->sl_PollTimer->tr_node.io_Command = TR_ADDREQUEST;
-                        SendIO((struct IORequest *)sl->sl_PollTimer);
-                    }
-                    /************************************************************/
-                    /* END OF NEW POLLING LOGIC                                 */
-                    /************************************************************/
 
                     /* Add NAKed-but-want-to-retry packets to
                      * the PacketsReady.
@@ -1967,6 +1945,10 @@ static void sl811hs_CommandTask(void)
 
                 FreeSignal(sl->sl_SigDone);
 
+                 if (wait_timeout_sig != -1) { // <-- ADD THIS BLOCK
+                    FreeSignal(wait_timeout_sig);
+                }
+
                 /* Abort any delayed packets */
                 if (GetHead(&sl->sl_PacketsDelayed)) {
                     while ((iou = (struct IOUsbHWReq *)RemHead((struct List *)&sl->sl_PacketsDelayed))) {
@@ -1988,13 +1970,6 @@ static void sl811hs_CommandTask(void)
                         FreeMem(nak, sizeof(*nak));
                 }
 
-                if(sl->sl_PollTimer) { // <-- ADD THIS entire block
-                    AbortIO((struct IORequest *)sl->sl_PollTimer);
-                    WaitIO((struct IORequest *)sl->sl_PollTimer);
-                    CloseDevice((struct IORequest *)sl->sl_PollTimer);
-                    DeleteIORequest((struct IORequest *)sl->sl_PollTimer);
-                    DeleteMsgPort(sl->sl_PollPort);
-                }
                 if(sl->sl_PollSignal != -1) {
                     FreeSignal(sl->sl_PollSignal);
                 }

@@ -892,12 +892,9 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     UBYTE state;
     UWORD portstatus, portchange;
 
-    if (sl->sl_PortScanned)
-        return;
-
     portstatus = sl->sl_PortStatus;
-    portchange = sl->sl_PortChange;
- 
+    portchange = 0; // Start with a clean slate for changes this scan
+
     // Read the actual D+/D- line status from the I/O Register
     state = rb(sl, 0x0c); // SL811HS_IREG_DPDM
 
@@ -921,17 +918,6 @@ static void sl811hs_PortScan(struct sl811hs *sl)
         } else { // Low-speed
             portstatus |= (1 << PORT_LOW_SPEED);
         }
-
-        // Update control registers for low or full speed connection
-        UBYTE ctrl1 = 0;
-        UBYTE ctrl2 = 0;
-        if (portstatus & (1 << PORT_LOW_SPEED)) {
-            ctrl1 |= SL811HS_CONTROL1_LOW_SPEED;
-            ctrl2 |= SL811HS_CONTROL2_LOW_SPEED;
-        }
-        wb(sl, SL811HS_CONTROL2, ctrl2 | SL811HS_CONTROL2_MASTER | SL811HS_CONTROL2_SOF_HIGH(0x2e));
-        wb(sl, SL811HS_SOFLOW, 0xe0);
-        wb(sl, SL811HS_CONTROL1, ctrl1 | SL811HS_CONTROL1_SOF_ENABLE);
     } else {
         // Device is disconnected (D+/D- are both low or some other invalid state)
         if (portstatus & (1 << PORT_CONNECTION)) {
@@ -940,14 +926,27 @@ static void sl811hs_PortScan(struct sl811hs *sl)
         }
         portstatus &= ~((1 << PORT_CONNECTION) | (1 << PORT_ENABLE) | (1 << PORT_LOW_SPEED));
     }
-
+    
+    // Only update and reconfigure control registers if the connection status changed
+    if (portchange & (1 << C_PORT_CONNECTION)) {
+        UBYTE ctrl1 = 0;
+        UBYTE ctrl2 = 0;
+        if (portstatus & (1 << PORT_CONNECTION)) {
+            if (portstatus & (1 << PORT_LOW_SPEED)) {
+                ctrl1 |= SL811HS_CONTROL1_LOW_SPEED;
+                ctrl2 |= SL811HS_CONTROL2_LOW_SPEED;
+            }
+            wb(sl, SL811HS_CONTROL2, ctrl2 | SL811HS_CONTROL2_MASTER | SL811HS_CONTROL2_SOF_HIGH(0x2e));
+            wb(sl, SL811HS_SOFLOW, 0xe0);
+            wb(sl, SL811HS_CONTROL1, ctrl1 | SL811HS_CONTROL1_SOF_ENABLE);
+        }
+    }
+    
     D(ebug("New PortStatus = %04x, PortChange = %04x\n", portstatus, portchange));
 
     /* Update port status */
     sl->sl_PortChange |= portchange;
     sl->sl_PortStatus = portstatus;
-
-    sl->sl_PortScanned = TRUE;
 }
 
 

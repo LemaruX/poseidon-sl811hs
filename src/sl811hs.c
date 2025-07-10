@@ -279,7 +279,6 @@ static inline UBYTE rb(struct sl811hs *sl, UBYTE addr)
 {
     UBYTE val;
 
-    Disable();
     sl->sl_CurrAddr = addr;
 
 #if DEBUG
@@ -292,7 +291,6 @@ static inline UBYTE rb(struct sl811hs *sl, UBYTE addr)
         *(sl->sl_Addr) = addr;
         val = *(sl->sl_Data);
     }
-    Enable();
 
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
     return val;
@@ -303,26 +301,21 @@ static inline void wb(struct sl811hs *sl, UBYTE addr, UBYTE val)
     sl->sl_CurrAddr = addr;
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
 
-    Disable();
 #if DEBUG
     if (sl->sl_Addr == NULL) {
         sl811hs_sim_Write(&sl->sl_Sim, 0, addr);
         sl811hs_sim_Write(&sl->sl_Sim, 1, val);
-    } else
-#endif
-    {
-        *(sl->sl_Addr) = addr;
-        *(sl->sl_Data) = val;
+        return;
     }
-    Enable();
+#endif
 
+    *(sl->sl_Addr) = addr;
+    *(sl->sl_Data) = val;
 }
 
 static inline UBYTE rn(struct sl811hs *sl)
 {
     UBYTE val;
-
-    Disable();
     sl->sl_CurrAddr++;
 
 #if DEBUG
@@ -339,7 +332,6 @@ static inline UBYTE rn(struct sl811hs *sl)
         }
         val = *(sl->sl_Data);
     }
-    Enable();
 
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
     return val;
@@ -351,22 +343,20 @@ static inline void wn(struct sl811hs *sl, UBYTE val)
 
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
 
-    Disable();
 #if DEBUG
     if (sl->sl_Addr == NULL) {
         sl811hs_sim_Write(&sl->sl_Sim, 1, val);
-    } else
-#endif
-    {
-        /* SL811HS < 1.5 has a broken
-        * autoincrement under certain conditions.
-        */
-        if (sl->sl_Errata <= SL811HS_ERRATA_1_5) {
-           *(sl->sl_Addr) = sl->sl_CurrAddr;
-        }
-      *(sl->sl_Data) = val;      
+        return;
     }
-    Enable();
+#endif
+
+    /* SL811HS < 1.5 has a broken
+     * autoincrement under certain conditions.
+     */
+    if (sl->sl_Errata <= SL811HS_ERRATA_1_5) {
+        *(sl->sl_Addr) = sl->sl_CurrAddr;
+    }
+    *(sl->sl_Data) = val;
 }
 
 static inline BOOL iouIsOut(struct IOUsbHWReq *iou)
@@ -636,7 +626,6 @@ static BYTE sl811hs_XferStatus(struct sl811hs *sl, struct sl811hs_Xfer *xfer)
     int data;
 
     status = rb(sl, SL811HS_HOSTSTATUS + ab);
-    wb(sl, SL811HS_HOSTSTATUS + ab, status);
     data = (xfer->ctl & SL811HS_HOSTCTRL_DATA) ? 1 : 0;
 
     D2(ebug("%p DATA%d PID_%s Status %02x\n", iou, data, PIDNAME(SL811HS_HOSTID_PID_of(xfer->pidep)), status));
@@ -1594,6 +1583,7 @@ static void sl811hs_CommandTask(void)
 #endif
     struct IOUsbHWReq *iou;
     struct Message *dead = NULL;
+    BYTE wait_timeout_sig = -1;
 
     struct timerequest *tr;
     struct MsgPort *tr_mp;
@@ -1608,44 +1598,18 @@ static void sl811hs_CommandTask(void)
                 ULONG sigfport;
                 ULONG sigfdone;
                 ULONG sigftime;
-                ULONG sigfpoll;
-            
-                BYTE wait_timeout_sig = -1;
 
                 sl->sl_TimeRequest = tr;
 
                 sl->sl_SigDone = AllocSignal(-1);
                 wait_timeout_sig = AllocSignal(-1);
 
-
-                if(sl->sl_PollPort) {
-                    sl->sl_PollTimer = (struct timerequest *)CreateIORequest(sl->sl_PollPort, sizeof(struct timerequest));
-                }
-                
-                if(sl->sl_PollTimer) {
-                    // Open a second instance of the timer device for our poll timer
-                    if(0 != OpenDevice("timer.device", UNIT_MICROHZ, (struct IORequest *)sl->sl_PollTimer, 0)) {
-                        // Failed, clean up
-                        DeleteIORequest((struct IORequest *)sl->sl_PollTimer);
-                        sl->sl_PollTimer = NULL;
-                    }
-                }
-                
-                // If any step failed, sl_PollTimer will be NULL. We need to clean up ports.
-                if(!sl->sl_PollTimer && sl->sl_PollPort) {
-                    DeleteMsgPort(sl->sl_PollPort);
-                    sl->sl_PollPort = NULL;
-                }
-
                 sigfdone = (1 << sl->sl_SigDone);
                 sigfport = (1 << sl->sl_CommandPort->mp_SigBit);
                 sigftime = (1 << sl->sl_TimeRequest->tr_node.io_Message.mn_ReplyPort->mp_SigBit);
+                sigmask  = sigfdone | sigfport | sigftime;
 
-                sigmask  = sigfdone | sigfport | sigftime ;
-
-                SetSignal(sigmask, sigmask);  // Clear any pending signals before we start
-
-                // Kick off the first poll timer request
+                SetSignal(sigmask, sigmask);
 
                 sl->sl_Interrupt.is_Node.ln_Pri = 0;
                 sl->sl_Interrupt.is_Node.ln_Type = NT_INTERRUPT;
@@ -1663,42 +1627,52 @@ static void sl811hs_CommandTask(void)
                 sl811hs_ResetHW(sl);
 
                 for (;;) {
-                        ULONG sigset;
-                        struct MinList todo;
-                        NEWLIST(&todo);
+                    ULONG sigset;
+                    struct MinList todo;
+                    NEWLIST(&todo);
 
-                        // Set a 20ms timeout on our Wait() call
+                    // Set a 20ms timeout on our Wait() call using the main timerequest
+                    if (wait_timeout_sig != -1) {
                         tr->tr_node.io_Command = TR_ADDREQUEST;
                         tr->tr_time.tv_secs = 0;
-                        tr->tr_time.tv_micro = 20000; // 20ms
-                        SetSignal(0, 1 << wait_timeout_sig); // Clear the signal bit before use
+                        tr->tr_time.tv_micro = 20000; // 20ms poll
+                        // Clear the signal bit before we send the IORequest
+                        SetSignal(0, 1 << wait_timeout_sig);
+                        // Assign our dedicated signal to the timer's reply port
                         tr->tr_node.io_Message.mn_ReplyPort->mp_SigBit = wait_timeout_sig;
                         tr->tr_node.io_Message.mn_ReplyPort->mp_SigTask = FindTask(NULL);
                         SendIO((struct IORequest *)tr);
+                    }
 
-                        // Wait for our standard signals OR the timeout signal
-                        sigset = Wait(sigmask | (1 << wait_timeout_sig));
-                        
-                        // IMPORTANT: If the wait was broken by a real signal, we must abort the timer request
-                        // so it doesn't fire later and corrupt our state.
-                        if(!(sigset & (1 << wait_timeout_sig))) {
+                    // Wait for a regular signal OR our timeout signal
+                    sigset = Wait(sigmask | (1 << wait_timeout_sig));
+
+                    // If the Wait() was broken by a signal OTHER than our timeout,
+                    // we MUST abort the timer request to prevent a stray signal later.
+                    if (wait_timeout_sig != -1) {
+                        if (!(sigset & (1 << wait_timeout_sig))) {
                             AbortIO((struct IORequest *)tr);
                         }
-                        WaitIO((struct IORequest *)tr); // Wait for AbortIO or the timeout to complete
+                        // This WaitIO is crucial. It waits for the AbortIO to complete OR for
+                        // the original timer request to complete, cleaning up the message port.
+                        WaitIO((struct IORequest *)tr);
+                    }
 
-                        /************************************************************/
-                        /* POLLING LOGIC - now in a safe context                    */
-                        /************************************************************/
-                        if (!IsListEmpty((struct List *)&sl->sl_XfersActive))
-                        {
-                            UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
-                            if (intstat & SL811HS_INTMASK_USB_A) {
-                                // Manually trigger the 'done' logic
-                                Signal(sl->sl_CommandTask, sigfdone);
-                            }
+                    /************************************************************/
+                    /* POLLING LOGIC - to catch missed interrupts               */
+                    /************************************************************/
+                    if (!IsListEmpty((struct List *)&sl->sl_XfersActive))
+                    {
+                        UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
+                        if (intstat & SL811HS_INTMASK_USB_A) {
+                            // The transaction is done but the interrupt was missed!
+                            // Manually signal our own task to run the interrupt handling logic.
+                            Signal(sl->sl_CommandTask, sigfdone);
                         }
-                        /************************************************************/
-
+                    }
+                    /************************************************************/
+                    
+                    /* The original loop logic now follows, unchanged. */
 
                     /* Add NAKed-but-want-to-retry packets to
                      * the PacketsReady.
@@ -1945,7 +1919,7 @@ static void sl811hs_CommandTask(void)
 
                 FreeSignal(sl->sl_SigDone);
 
-                 if (wait_timeout_sig != -1) { // <-- ADD THIS BLOCK
+                if (wait_timeout_sig != -1) {
                     FreeSignal(wait_timeout_sig);
                 }
 
@@ -1968,10 +1942,6 @@ static void sl811hs_CommandTask(void)
                     struct sl811hs_NakTimer *nak;
                     while ((nak = (struct sl811hs_NakTimer *)RemHead((struct List *)&sl->sl_NakTimersFree))) 
                         FreeMem(nak, sizeof(*nak));
-                }
-
-                if(sl->sl_PollSignal != -1) {
-                    FreeSignal(sl->sl_PollSignal);
                 }
 
                 CloseDevice((struct IORequest *)tr);

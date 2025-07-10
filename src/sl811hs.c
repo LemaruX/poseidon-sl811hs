@@ -1617,6 +1617,7 @@ static void sl811hs_CommandTask(void)
                 sl->sl_TimeRequest = tr;
 
                 sl->sl_SigDone = AllocSignal(-1);
+                sl->sl_PollSignal = AllocSignal(-1);
 
                 if(sl->sl_PollSignal != -1)
                 {
@@ -1703,7 +1704,6 @@ static void sl811hs_CommandTask(void)
                         }
                     }
 
-                    // If our polling timer fired, we must re-arm it
                     // If our polling timer fired, we must re-arm it
                     if(sigset & sigfpoll)
                     {

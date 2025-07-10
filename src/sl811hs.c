@@ -898,7 +898,6 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     portstatus = sl->sl_PortStatus;
     portchange = sl->sl_PortChange;
  
-    wb(sl, SL811HS_INTSTATUS, 0xff);
     state = rb(sl, SL811HS_INTSTATUS);
 
     D(ebug("Port changed %04x: %02x\n", portstatus, state));
@@ -1090,7 +1089,7 @@ BYTE sl811hs_Resume(struct sl811hs *sl)
 struct UsbStdDevDesc const sl811hs_DevDesc = {
     .bLength = sizeof(struct UsbStdDevDesc),
     .bDescriptorType = UDT_DEVICE,
-    .bcdUSB = CONST_WORD2LE(0x0200),
+    .bcdUSB = CONST_WORD2LE(0x0110),
     .bDeviceClass = HUB_CLASSCODE, /* HUB */
     .bDeviceSubClass = 0,
     .bDeviceProtocol = 0, /* Full speed hub */
@@ -1133,7 +1132,7 @@ struct UsbStdEPDesc const sl811hs_EPDesc = {
     .bEndpointAddress = 0x81,
     .bmAttributes = 3,
     .wMaxPacketSize = CONST_WORD2LE(2),
-    .bInterval = 32
+    .bInterval = 12
 };
 
 struct slUsbStdStrDesc

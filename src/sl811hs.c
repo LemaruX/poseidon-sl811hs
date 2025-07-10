@@ -636,6 +636,7 @@ static BYTE sl811hs_XferStatus(struct sl811hs *sl, struct sl811hs_Xfer *xfer)
     int data;
 
     status = rb(sl, SL811HS_HOSTSTATUS + ab);
+    wb(sl, SL811HS_HOSTSTATUS + ab, status);
     data = (xfer->ctl & SL811HS_HOSTCTRL_DATA) ? 1 : 0;
 
     D2(ebug("%p DATA%d PID_%s Status %02x\n", iou, data, PIDNAME(SL811HS_HOSTID_PID_of(xfer->pidep)), status));

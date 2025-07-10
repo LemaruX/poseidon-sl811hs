@@ -444,14 +444,10 @@ static void sl811hs_XferIssue(struct sl811hs *sl, struct sl811hs_Xfer *xfer)
 
     D2(ebug("%p DATA%d %s\n", xfer->iou, (ctl & SL811HS_HOSTCTRL_DATA) ? 1 : 0, PIDNAME(SL811HS_HOSTID_PID_of(xfer->pidep))));
 
-#ifndef DEBUG
-    /* Errata 1.5, section 2 */
-    if (!(sl->sl_PortStatus & (1 << PORT_LOW_SPEED))) {
-        int ticks = (xfer->len >> 3) + 3;
-        if (rb(sl, SL811HS_SOFHIGH) <= ticks)
-            ctl |= SL811HS_HOSTCTRL_SYNCSOF;
+    /* Unconditionally enable SYNCSOF for non-ISO transfers to ensure reliability */
+    if (!(ctl & SL811HS_HOSTCTRL_ISO)) {
+        ctl |= SL811HS_HOSTCTRL_SYNCSOF;
     }
-#endif
 
     xfer->ctl = ctl;
     wb(sl, xfer->ab + SL811HS_HOSTCTRL, ctl);
@@ -892,8 +888,7 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     UBYTE state;
     UWORD portstatus, portchange;
 
-    if (sl->sl_PortScanned)
-        return;
+    /* Removed sl_PortScanned check to allow continuous polling */
 
     portstatus = sl->sl_PortStatus;
     portchange = sl->sl_PortChange;
@@ -906,8 +901,8 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     if (state & SL811HS_INTMASK_DETECT) {
         portstatus &= ~((1 << PORT_CONNECTION) |
                         (1 << PORT_ENABLE));
-        portchange |= (1 << PORT_CONNECTION) |
-                      (1 << PORT_ENABLE);
+        portchange |= (1 << C_PORT_CONNECTION) |
+                      (1 << C_PORT_ENABLE);
 
         portstatus &= ~(1 << PORT_LOW_SPEED);
 
@@ -917,9 +912,11 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     } else {
         UBYTE ctrl1 = 0;
         UBYTE ctrl2 = 0;
-
+        
+        if (!(portstatus & (1 << PORT_CONNECTION))) {
+            portchange |= (1 << C_PORT_CONNECTION);
+        }
         portstatus |= (1 << PORT_CONNECTION);
-        portchange |= (1 << PORT_CONNECTION);
 
         if (state & SL811HS_INTMASK_FULLSPEED) {
             portstatus &= ~(1 << PORT_LOW_SPEED);
@@ -938,7 +935,7 @@ static void sl811hs_PortScan(struct sl811hs *sl)
         wb(sl, SL811HS_CONTROL1, ctrl1 | SL811HS_CONTROL1_SOF_ENABLE);
 
         portstatus |= (1 << PORT_ENABLE);
-        portchange |= (1 << PORT_ENABLE);
+        portchange |= (1 << C_PORT_ENABLE);
     }
 
     D(ebug("Port changed %04x: %sonnected, %s speed\n", portstatus,
@@ -948,8 +945,6 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     /* Update port status */
     sl->sl_PortChange = portchange;
     sl->sl_PortStatus = portstatus;
-
-    sl->sl_PortScanned = TRUE;
 }
 
 
@@ -1661,6 +1656,9 @@ static void sl811hs_CommandTask(void)
                     /************************************************************/
                     /* POLLING LOGIC - to catch missed interrupts               */
                     /************************************************************/
+                    // Always re-scan the port status on every poll or event
+                    sl->sl_PortScanned = FALSE;
+                    
                     // Define which interrupts we are actively listening for.
                     // This should match the bits set in the INTENABLE register.
                     #ifdef ENABLE_B
@@ -1701,7 +1699,6 @@ static void sl811hs_CommandTask(void)
                         BYTE err;
 
                         /* Scan for any port status changes */
-                        sl->sl_PortScanned = FALSE; // Force PortScan to run
                         sl811hs_PortScan(sl);
 
                         /* Completed xfers need to be processed and

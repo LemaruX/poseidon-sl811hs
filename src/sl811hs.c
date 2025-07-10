@@ -1618,22 +1618,28 @@ static void sl811hs_CommandTask(void)
 
                 sl->sl_SigDone = AllocSignal(-1);
 
-                if(sl->sl_PollSignal != -1) // <-- ADD THIS and the following block
+                if(sl->sl_PollSignal != -1)
                 {
                     sl->sl_PollPort = CreateMsgPort();
-                    if(sl->sl_PollPort) {
-                        sl->sl_PollTimer = (struct timerequest *)CreateIORequest(sl->sl_PollPort, sizeof(struct timerequest));
+                }
+
+                if(sl->sl_PollPort) {
+                    sl->sl_PollTimer = (struct timerequest *)CreateIORequest(sl->sl_PollPort, sizeof(struct timerequest));
+                }
+                
+                if(sl->sl_PollTimer) {
+                    // Open a second instance of the timer device for our poll timer
+                    if(0 != OpenDevice("timer.device", UNIT_MICROHZ, (struct IORequest *)sl->sl_PollTimer, 0)) {
+                        // Failed, clean up
+                        DeleteIORequest((struct IORequest *)sl->sl_PollTimer);
+                        sl->sl_PollTimer = NULL;
                     }
-                    if(sl->sl_PollTimer) {
-                        // Open a second instance of the timer device for our poll timer
-                        if(0 != OpenDevice("timer.device", UNIT_MICROHZ, (struct IORequest *)sl->sl_PollTimer, 0)) {
-                            // Failed, clean up
-                            DeleteIORequest((struct IORequest *)sl->sl_PollTimer);
-                            sl->sl_PollTimer = NULL;
-                            DeleteMsgPort(sl->sl_PollPort);
-                            sl->sl_PollPort = NULL;
-                        }
-                    }
+                }
+                
+                // If any step failed, sl_PollTimer will be NULL. We need to clean up ports.
+                if(!sl->sl_PollTimer && sl->sl_PollPort) {
+                    DeleteMsgPort(sl->sl_PollPort);
+                    sl->sl_PollPort = NULL;
                 }
 
                 sigfdone = (1 << sl->sl_SigDone);
@@ -1698,10 +1704,17 @@ static void sl811hs_CommandTask(void)
                     }
 
                     // If our polling timer fired, we must re-arm it
+                    // If our polling timer fired, we must re-arm it
                     if(sigset & sigfpoll)
                     {
-                        // We don't need to get the message, the signal is enough.
-                        // Just re-send the request for the next 20ms.
+                        // Acknowledge the timer's reply message.
+                        // This is CRITICAL to clear the signal bit.
+                        // We use a while loop to ensure the port is empty.
+                        while(GetMsg(sl->sl_PollPort)) {
+                            /* do nothing, just empty the port */
+                        }
+
+                        // Now that the signal is clear, re-send the request for the next poll.
                         sl->sl_PollTimer->tr_node.io_Command = TR_ADDREQUEST;
                         SendIO((struct IORequest *)sl->sl_PollTimer);
                     }

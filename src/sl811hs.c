@@ -279,6 +279,7 @@ static inline UBYTE rb(struct sl811hs *sl, UBYTE addr)
 {
     UBYTE val;
 
+    Disable();
     sl->sl_CurrAddr = addr;
 
 #if DEBUG
@@ -291,6 +292,7 @@ static inline UBYTE rb(struct sl811hs *sl, UBYTE addr)
         *(sl->sl_Addr) = addr;
         val = *(sl->sl_Data);
     }
+    Enable();
 
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
     return val;
@@ -301,21 +303,26 @@ static inline void wb(struct sl811hs *sl, UBYTE addr, UBYTE val)
     sl->sl_CurrAddr = addr;
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
 
+    Disable();
 #if DEBUG
     if (sl->sl_Addr == NULL) {
         sl811hs_sim_Write(&sl->sl_Sim, 0, addr);
         sl811hs_sim_Write(&sl->sl_Sim, 1, val);
-        return;
-    }
+    } else
 #endif
+    {
+        *(sl->sl_Addr) = addr;
+        *(sl->sl_Data) = val;
+    }
+    Enable();
 
-    *(sl->sl_Addr) = addr;
-    *(sl->sl_Data) = val;
 }
 
 static inline UBYTE rn(struct sl811hs *sl)
 {
     UBYTE val;
+
+    Disable();
     sl->sl_CurrAddr++;
 
 #if DEBUG
@@ -332,6 +339,7 @@ static inline UBYTE rn(struct sl811hs *sl)
         }
         val = *(sl->sl_Data);
     }
+    Enable();
 
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
     return val;
@@ -343,20 +351,22 @@ static inline void wn(struct sl811hs *sl, UBYTE val)
 
     D2(ebug("%02x = %02x\n", sl->sl_CurrAddr, val));
 
+    Disable();
 #if DEBUG
     if (sl->sl_Addr == NULL) {
         sl811hs_sim_Write(&sl->sl_Sim, 1, val);
-        return;
-    }
+    } else
 #endif
-
-    /* SL811HS < 1.5 has a broken
-     * autoincrement under certain conditions.
-     */
-    if (sl->sl_Errata <= SL811HS_ERRATA_1_5) {
-        *(sl->sl_Addr) = sl->sl_CurrAddr;
+    {
+        /* SL811HS < 1.5 has a broken
+        * autoincrement under certain conditions.
+        */
+        if (sl->sl_Errata <= SL811HS_ERRATA_1_5) {
+           *(sl->sl_Addr) = sl->sl_CurrAddr;
+        }
+      *(sl->sl_Data) = val;      
     }
-    *(sl->sl_Data) = val;
+    Enable();
 }
 
 static inline BOOL iouIsOut(struct IOUsbHWReq *iou)

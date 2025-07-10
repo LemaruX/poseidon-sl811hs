@@ -898,6 +898,7 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     portstatus = sl->sl_PortStatus;
     portchange = sl->sl_PortChange;
  
+    wb(sl, SL811HS_INTSTATUS, 0xff);
     state = rb(sl, SL811HS_INTSTATUS);
 
     D(ebug("Port changed %04x: %02x\n", portstatus, state));
@@ -1089,7 +1090,7 @@ BYTE sl811hs_Resume(struct sl811hs *sl)
 struct UsbStdDevDesc const sl811hs_DevDesc = {
     .bLength = sizeof(struct UsbStdDevDesc),
     .bDescriptorType = UDT_DEVICE,
-    .bcdUSB = CONST_WORD2LE(0x0110),
+    .bcdUSB = CONST_WORD2LE(0x0200),
     .bDeviceClass = HUB_CLASSCODE, /* HUB */
     .bDeviceSubClass = 0,
     .bDeviceProtocol = 0, /* Full speed hub */
@@ -1132,7 +1133,7 @@ struct UsbStdEPDesc const sl811hs_EPDesc = {
     .bEndpointAddress = 0x81,
     .bmAttributes = 3,
     .wMaxPacketSize = CONST_WORD2LE(2),
-    .bInterval = 12
+    .bInterval = 255
 };
 
 struct slUsbStdStrDesc
@@ -1448,96 +1449,110 @@ static void sl811hs_ReplyOrRetry(struct sl811hs *sl, struct IOUsbHWReq *iou)
 {
     struct sl811hs_NakTimer *nak;
 
-    do {
-        if (iou->iouh_Req.io_Command < CMD_NONSTD)
+    /*
+     * Determine if this is a command that can be retried on NAK.
+     * Only actual data transfer commands should enter the retry logic.
+     * Management commands (SUSPEND, RESUME, etc.) must be replied to immediately.
+     */
+    switch (iou->iouh_Req.io_Command) {
+        case UHCMD_CONTROLXFER:
+        case UHCMD_BULKXFER:
+        case UHCMD_INTXFER:
+        case UHCMD_ISOXFER:
+            /* This is a data transfer, apply the retry logic */
             break;
 
-        /* Handle runt transactions */
-        if ((iou->iouh_Flags & UHFF_ALLOWRUNTPKTS) &&
-            (iou->iouh_Req.io_Error == UHIOERR_RUNTPACKET)) {
-            iou->iouh_Req.io_Error = 0;
-            break;
+        default:
+            /* This is a management command or has an unrecoverable error.
+             * Go directly to ReplyMsg.
+             */
+            goto reply_now;
+    }
+
+    /* Handle runt transactions */
+    if ((iou->iouh_Flags & UHFF_ALLOWRUNTPKTS) &&
+        (iou->iouh_Req.io_Error == UHIOERR_RUNTPACKET)) {
+        iou->iouh_Req.io_Error = 0;
+        goto reply_now;
+    }
+
+    /* Handle non-NAK error codes */
+    if (iou->iouh_Req.io_Error != UHIOERR_NAK) {
+        if (iou->iouh_DriverPrivate2) {
+            D2(ebug("%p Clear iouh_DriverPrivate2\n", iou));
+            nak = (struct sl811hs_NakTimer *)iou->iouh_DriverPrivate2;
+            AbortIO((struct IORequest *)nak);
+            WaitIO((struct IORequest *)nak);
+            nak->iou = NULL;
+            iou->iouh_DriverPrivate2 = NULL;
+            AddTail((struct List *)&sl->sl_NakTimersFree, (struct Node *)nak);
         }
+        goto reply_now;
+    }
 
-        /* Handle non-NAK error codes
-         */
-        if (iou->iouh_Req.io_Error != UHIOERR_NAK) {
-            if (iou->iouh_DriverPrivate2) {
-                D2(ebug("%p Clear iouh_DriverPrivate2\n", iou));
-                nak = (struct sl811hs_NakTimer *)iou->iouh_DriverPrivate2;
-                AbortIO((struct IORequest *)nak);
-                WaitIO((struct IORequest *)nak);
-                nak->iou = NULL;
-                iou->iouh_DriverPrivate2 = NULL;
-                AddTail((struct List *)&sl->sl_NakTimersFree, (struct Node *)nak);
-                nak = NULL;
-            }
-            break;
-        }
-
-        /* From here on, we are in a NAK or Retry */
-        if (iou->iouh_DriverPrivate2 == NULL) {
-            nak = (struct sl811hs_NakTimer *)RemHead((struct List *)&sl->sl_NakTimersFree);
-            if (nak == NULL) {
-                /* Allocate a new timer, and clone the request from the main thread */
-                nak = AllocMem(sizeof(*nak), MEMF_ANY);
-                if (nak != NULL) { 
-                    CopyMem(sl->sl_TimeRequest, &nak->tr, sizeof(struct timerequest));
-                }
-            }
+    /* From here on, we are in a NAK or Retry */
+    if (iou->iouh_DriverPrivate2 == NULL) {
+        nak = (struct sl811hs_NakTimer *)RemHead((struct List *)&sl->sl_NakTimersFree);
+        if (nak == NULL) {
+            /* Allocate a new timer, and clone the request from the main thread */
+            nak = AllocMem(sizeof(*nak), MEMF_ANY);
             if (nak != NULL) {
-                iou->iouh_DriverPrivate2 = nak;
-                nak->iou = iou;
-                nak->interval = iou->iouh_Interval;
-                nak->time = 0;
-                nak->error = 1;
-                if (sl->sl_PortStatus & (1 << PORT_LOW_SPEED))
-                    nak->interval = MS2UFRAME(nak->interval);
-                if (nak->interval == 0)
-                    nak->interval = MS2UFRAME(iou->iouh_NakTimeout) / 16;
-                if (nak->interval == 0)
-                    nak->interval = DEFAULT_INTERVAL;
+                CopyMem(sl->sl_TimeRequest, &nak->tr, sizeof(struct timerequest));
+            }
+        }
+        if (nak != NULL) {
+            iou->iouh_DriverPrivate2 = nak;
+            nak->iou = iou;
+            nak->interval = iou->iouh_Interval;
+            nak->time = 0;
+            nak->error = 1;
+            if (sl->sl_PortStatus & (1 << PORT_LOW_SPEED))
+                nak->interval = MS2UFRAME(nak->interval);
+            if (nak->interval == 0)
+                nak->interval = MS2UFRAME(iou->iouh_NakTimeout) / 16;
+            if (nak->interval == 0)
+                nak->interval = DEFAULT_INTERVAL;
+        }
+    } else {
+        BOOL done = FALSE;
+        nak = iou->iouh_DriverPrivate2;
+        if (iou->iouh_Flags & UHFF_NAKTIMEOUT) {
+            if (iou->iouh_NakTimeout && (UFRAME2MS(nak->time) > iou->iouh_NakTimeout)) {
+                D2(ebug("%p timed out after %sms\n", iou, UFRAME2MS(nak->time)));
+                done = TRUE;
             }
         } else {
-            BOOL done = FALSE;
-            nak = iou->iouh_DriverPrivate2;
-            if (iou->iouh_Flags & UHFF_NAKTIMEOUT) {
-                if (iou->iouh_NakTimeout && (UFRAME2MS(nak->time) > iou->iouh_NakTimeout)) {
-                    D2(ebug("%p timed out after %sms\n", iou, UFRAME2MS(nak->time)));
-                    done = TRUE;
-                }
-            } else {
-                nak->error++;
-                if (nak->error > 3) {
-                    D2(ebug("%p received 3 NAKs\n", iou));
-                    done = TRUE;
-                }
-            }
-            if (done) {
-                AbortIO((struct IORequest *)nak);
-                WaitIO((struct IORequest *)nak);
-                nak->iou = NULL;
-                AddTail((struct List *)&sl->sl_NakTimersFree, (struct Node *)nak);
-                iou->iouh_DriverPrivate2 = NULL;
-                iou->iouh_Req.io_Error = ((iou->iouh_Flags & UHFF_NAKTIMEOUT)) ? UHIOERR_NAKTIMEOUT : UHIOERR_NAK;
-                break;
+            nak->error++;
+            if (nak->error > 3) {
+                D2(ebug("%p received 3 NAKs\n", iou));
+                done = TRUE;
             }
         }
-
-        if (nak) {
-            nak->tr.tr_time.tv_secs  = UFRAME2US(nak->interval) / 1000000;
-            nak->tr.tr_time.tv_micro = UFRAME2US(nak->interval) % 1000000;
-            nak->tr.tr_node.io_Command = TR_ADDREQUEST;
-            D(ebug("%p NAK, retry in %d ms, %d ms left (%d frames waited)\n", iou, UFRAME2MS(nak->interval), (iou->iouh_Flags & UHFF_NAKTIMEOUT) ? (iou->iouh_NakTimeout - UFRAME2MS(nak->time)) : -1, nak->time));
-            AddTail((struct List *)&sl->sl_PacketsDelayed, (struct Node *)nak->iou);
-            SendIO((struct IORequest *)nak);
-            return;
+        if (done) {
+            AbortIO((struct IORequest *)nak);
+            WaitIO((struct IORequest *)nak);
+            nak->iou = NULL;
+            AddTail((struct List *)&sl->sl_NakTimersFree, (struct Node *)nak);
+            iou->iouh_DriverPrivate2 = NULL;
+            iou->iouh_Req.io_Error = ((iou->iouh_Flags & UHFF_NAKTIMEOUT)) ? UHIOERR_NAKTIMEOUT : UHIOERR_NAK;
+            goto reply_now;
         }
+    }
 
-        iou->iouh_Req.io_Error = UHIOERR_OUTOFMEMORY;
+    if (nak) {
+        nak->tr.tr_time.tv_secs  = UFRAME2US(nak->interval) / 1000000;
+        nak->tr.tr_time.tv_micro = UFRAME2US(nak->interval) % 1000000;
+        nak->tr.tr_node.io_Command = TR_ADDREQUEST;
+        D(ebug("%p NAK, retry in %d ms, %d ms left (%d frames waited)\n", iou, UFRAME2MS(nak->interval), (iou->iouh_Flags & UHFF_NAKTIMEOUT) ? (iou->iouh_NakTimeout - UFRAME2MS(nak->time)) : -1, nak->time));
+        AddTail((struct List *)&sl->sl_PacketsDelayed, (struct Node *)nak->iou);
+        SendIO((struct IORequest *)nak);
+        return; /* This is correct: we are delaying the reply */
+    }
 
-    } while (0);
+    /* Fallthrough case: Could not allocate a NAK timer */
+    iou->iouh_Req.io_Error = UHIOERR_OUTOFMEMORY;
 
+reply_now:
     D2(ebug("%p ReplyMsg(%d)\n", iou, iou->iouh_Req.io_Error));
     ReplyMsg((struct Message *)iou);
 }
@@ -1582,7 +1597,6 @@ static void sl811hs_CommandTask(void)
 #endif
     struct IOUsbHWReq *iou;
     struct Message *dead = NULL;
-    BYTE wait_timeout_sig = -1;
 
     struct timerequest *tr;
     struct MsgPort *tr_mp;
@@ -1601,8 +1615,6 @@ static void sl811hs_CommandTask(void)
                 sl->sl_TimeRequest = tr;
 
                 sl->sl_SigDone = AllocSignal(-1);
-                wait_timeout_sig = AllocSignal(-1);
-
                 sigfdone = (1 << sl->sl_SigDone);
                 sigfport = (1 << sl->sl_CommandPort->mp_SigBit);
                 sigftime = (1 << sl->sl_TimeRequest->tr_node.io_Message.mn_ReplyPort->mp_SigBit);
@@ -1630,58 +1642,7 @@ static void sl811hs_CommandTask(void)
                     struct MinList todo;
                     NEWLIST(&todo);
 
-                    // Set a 20ms timeout on our Wait() call using the main timerequest
-                    if (wait_timeout_sig != -1) {
-                        tr->tr_node.io_Command = TR_ADDREQUEST;
-                        tr->tr_time.tv_secs = 0;
-                        tr->tr_time.tv_micro = 20000; // 20ms poll
-                        // Clear the signal bit before we send the IORequest
-                        SetSignal(0, 1 << wait_timeout_sig);
-                        // Assign our dedicated signal to the timer's reply port
-                        tr->tr_node.io_Message.mn_ReplyPort->mp_SigBit = wait_timeout_sig;
-                        tr->tr_node.io_Message.mn_ReplyPort->mp_SigTask = FindTask(NULL);
-                        SendIO((struct IORequest *)tr);
-                    }
-
-                    // Wait for a regular signal OR our timeout signal
-                    sigset = Wait(sigmask | (1 << wait_timeout_sig));
-
-                    // If the Wait() was broken by a signal OTHER than our timeout,
-                    // we MUST abort the timer request to prevent a stray signal later.
-                    if (wait_timeout_sig != -1) {
-                        if (!(sigset & (1 << wait_timeout_sig))) {
-                            AbortIO((struct IORequest *)tr);
-                        }
-                        // This WaitIO is crucial. It waits for the AbortIO to complete OR for
-                        // the original timer request to complete, cleaning up the message port.
-                        WaitIO((struct IORequest *)tr);
-                    }
-
-                    /************************************************************/
-                    /* POLLING LOGIC - to catch missed interrupts               */
-                    /************************************************************/
-                    // Define which interrupts we are actively listening for.
-                    // This should match the bits set in the INTENABLE register.
-                    #ifdef ENABLE_B
-                    UBYTE enabled_interrupts = SL811HS_INTMASK_CHANGED | SL811HS_INTMASK_USB_A | SL811HS_INTMASK_USB_B;
-                    #else
-                    UBYTE enabled_interrupts = SL811HS_INTMASK_CHANGED | SL811HS_INTMASK_USB_A;
-                    #endif
-
-                    // Read the hardware's interrupt status register.
-                    UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
-
-                    // Check if any of the interrupts we care about have occurred.
-                    if (intstat & enabled_interrupts) {
-                        // An interrupt we care about has occurred but the
-                        // hardware interrupt signal was missed!
-                        // Manually signal our own task to run the main
-                        // interrupt handling logic.
-                        Signal(sl->sl_CommandTask, sigfdone);
-                    }
-                    /************************************************************/
-                    
-                    /* The original loop logic now follows, unchanged. */
+                    sigset = Wait(sigmask);
 
                     /* Add NAKed-but-want-to-retry packets to
                      * the PacketsReady.
@@ -1927,10 +1888,6 @@ static void sl811hs_CommandTask(void)
                     RemIntServer(sl->sl_Irq, &sl->sl_Interrupt);
 
                 FreeSignal(sl->sl_SigDone);
-
-                if (wait_timeout_sig != -1) {
-                    FreeSignal(wait_timeout_sig);
-                }
 
                 /* Abort any delayed packets */
                 if (GetHead(&sl->sl_PacketsDelayed)) {

@@ -892,61 +892,64 @@ static void sl811hs_PortScan(struct sl811hs *sl)
     UBYTE state;
     UWORD portstatus, portchange;
 
+    if (sl->sl_PortScanned)
+        return;
+
     portstatus = sl->sl_PortStatus;
-    portchange = 0; // Start with a clean slate for changes this scan
+    portchange = sl->sl_PortChange;
+ 
+    wb(sl, SL811HS_INTSTATUS, 0xff);
+    state = rb(sl, SL811HS_INTSTATUS);
 
-    // Read the actual D+/D- line status from the I/O Register
-    state = rb(sl, 0x0c); // SL811HS_IREG_DPDM
+    D(ebug("Port changed %04x: %02x\n", portstatus, state));
 
-    D(ebug("Port line state (Reg 0x0c) = %02x\n", state));
+    if (state & SL811HS_INTMASK_DETECT) {
+        portstatus &= ~((1 << PORT_CONNECTION) |
+                        (1 << PORT_ENABLE));
+        portchange |= (1 << PORT_CONNECTION) |
+                      (1 << PORT_ENABLE);
 
-    // Check for a connected device
-    // Full-speed idle: D+ high (bit 6 = 1), D- low (bit 7 = 0) -> 0x40
-    // Low-speed idle:  D+ low (bit 6 = 0), D- high (bit 7 = 1) -> 0x80
-    if ((state & 0xC0) == 0x40 || (state & 0xC0) == 0x80) {
-        // Device is connected
-        if (!(portstatus & (1 << PORT_CONNECTION))) {
-            // It was previously disconnected, so this is a new connection event
-            portchange |= (1 << C_PORT_CONNECTION);
-        }
-        portstatus |= (1 << PORT_CONNECTION);
-        portstatus |= (1 << PORT_ENABLE);
+        portstatus &= ~(1 << PORT_LOW_SPEED);
 
-        // Determine speed
-        if ((state & 0xC0) == 0x40) { // Full-speed
-            portstatus &= ~(1 << PORT_LOW_SPEED);
-        } else { // Low-speed
-            portstatus |= (1 << PORT_LOW_SPEED);
-        }
+        wb(sl, SL811HS_INTSTATUS, SL811HS_INTMASK_DETECT);
+        if (rb(sl, SL811HS_INTSTATUS) & SL811HS_INTMASK_DETECT)
+            wb(sl, SL811HS_INTSTATUS, 0xff);
     } else {
-        // Device is disconnected (D+/D- are both low or some other invalid state)
-        if (portstatus & (1 << PORT_CONNECTION)) {
-            // It was previously connected, so this is a new disconnection event
-            portchange |= (1 << C_PORT_CONNECTION);
-        }
-        portstatus &= ~((1 << PORT_CONNECTION) | (1 << PORT_ENABLE) | (1 << PORT_LOW_SPEED));
-    }
-    
-    // Only update and reconfigure control registers if the connection status changed
-    if (portchange & (1 << C_PORT_CONNECTION)) {
         UBYTE ctrl1 = 0;
         UBYTE ctrl2 = 0;
-        if (portstatus & (1 << PORT_CONNECTION)) {
-            if (portstatus & (1 << PORT_LOW_SPEED)) {
-                ctrl1 |= SL811HS_CONTROL1_LOW_SPEED;
-                ctrl2 |= SL811HS_CONTROL2_LOW_SPEED;
-            }
-            wb(sl, SL811HS_CONTROL2, ctrl2 | SL811HS_CONTROL2_MASTER | SL811HS_CONTROL2_SOF_HIGH(0x2e));
-            wb(sl, SL811HS_SOFLOW, 0xe0);
-            wb(sl, SL811HS_CONTROL1, ctrl1 | SL811HS_CONTROL1_SOF_ENABLE);
+
+        portstatus |= (1 << PORT_CONNECTION);
+        portchange |= (1 << PORT_CONNECTION);
+
+        if (state & SL811HS_INTMASK_FULLSPEED) {
+            portstatus &= ~(1 << PORT_LOW_SPEED);
+        } else {
+            portstatus |= (1 << PORT_LOW_SPEED);
         }
+
+        /* Update control registers for low or full speed connection */
+        if (portstatus & (1 << PORT_LOW_SPEED)) {
+            ctrl1 |= SL811HS_CONTROL1_LOW_SPEED;
+            ctrl2 |= SL811HS_CONTROL2_LOW_SPEED;
+        }
+
+        wb(sl, SL811HS_CONTROL2, ctrl2 | SL811HS_CONTROL2_MASTER | SL811HS_CONTROL2_SOF_HIGH(0x2e));
+        wb(sl, SL811HS_SOFLOW, 0xe0);
+        wb(sl, SL811HS_CONTROL1, ctrl1 | SL811HS_CONTROL1_SOF_ENABLE);
+
+        portstatus |= (1 << PORT_ENABLE);
+        portchange |= (1 << PORT_ENABLE);
     }
-    
-    D(ebug("New PortStatus = %04x, PortChange = %04x\n", portstatus, portchange));
+
+    D(ebug("Port changed %04x: %sonnected, %s speed\n", portstatus,
+                (portstatus & (1 << PORT_CONNECTION)) ? "C" : "Disc",
+                (portstatus & (1 << PORT_LOW_SPEED)) ? "Low" : "Full"));
 
     /* Update port status */
-    sl->sl_PortChange |= portchange;
+    sl->sl_PortChange = portchange;
     sl->sl_PortStatus = portstatus;
+
+    sl->sl_PortScanned = TRUE;
 }
 
 
@@ -1698,6 +1701,7 @@ static void sl811hs_CommandTask(void)
                         BYTE err;
 
                         /* Scan for any port status changes */
+                        sl->sl_PortScanned = FALSE; // Force PortScan to run
                         sl811hs_PortScan(sl);
 
                         /* Completed xfers need to be processed and

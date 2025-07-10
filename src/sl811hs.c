@@ -1661,14 +1661,24 @@ static void sl811hs_CommandTask(void)
                     /************************************************************/
                     /* POLLING LOGIC - to catch missed interrupts               */
                     /************************************************************/
-                    if (!IsListEmpty((struct List *)&sl->sl_XfersActive))
-                    {
-                        UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
-                        if (intstat & SL811HS_INTMASK_USB_A) {
-                            // The transaction is done but the interrupt was missed!
-                            // Manually signal our own task to run the interrupt handling logic.
-                            Signal(sl->sl_CommandTask, sigfdone);
-                        }
+                    // Define which interrupts we are actively listening for.
+                    // This should match the bits set in the INTENABLE register.
+                    #ifdef ENABLE_B
+                    UBYTE enabled_interrupts = SL811HS_INTMASK_CHANGED | SL811HS_INTMASK_USB_A | SL811HS_INTMASK_USB_B;
+                    #else
+                    UBYTE enabled_interrupts = SL811HS_INTMASK_CHANGED | SL811HS_INTMASK_USB_A;
+                    #endif
+
+                    // Read the hardware's interrupt status register.
+                    UBYTE intstat = rb(sl, SL811HS_INTSTATUS);
+
+                    // Check if any of the interrupts we care about have occurred.
+                    if (intstat & enabled_interrupts) {
+                        // An interrupt we care about has occurred but the
+                        // hardware interrupt signal was missed!
+                        // Manually signal our own task to run the main
+                        // interrupt handling logic.
+                        Signal(sl->sl_CommandTask, sigfdone);
                     }
                     /************************************************************/
                     

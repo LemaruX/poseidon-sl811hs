@@ -1133,7 +1133,7 @@ struct UsbStdEPDesc const sl811hs_EPDesc = {
     .bEndpointAddress = 0x81,
     .bmAttributes = 3,
     .wMaxPacketSize = CONST_WORD2LE(2),
-    .bInterval = 255
+    .bInterval = 32
 };
 
 struct slUsbStdStrDesc
